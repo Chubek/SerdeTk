@@ -79,3 +79,5 @@ docs/build-*
 docs/sphinx
 
 AGENTS.md
+.agents
+.codex
