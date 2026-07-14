@@ -1,4 +1,6 @@
-#include "../../SerdeTk.hpp"
+#include "../../../include/SerdeTk.hpp"
+#include "../../../stdplugin/SerdeTk/Semver/Parser.hpp"
+#include "../../../stdplugin/SerdeTk/Semver/Resolver.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -34,7 +36,7 @@ static void test_query_invalid_index_deterministic() {
 }
 
 static void test_cbor_sktl_compile_and_registry() {
-    auto fmt = sktl::compile_file("std/binary/CBOR.sktl");
+    auto fmt = sktl::compile_file("stdspec/binary/CBOR.sktl");
     assert(fmt.name == "CBOR");
     assert(fmt.is_binary());
     assert(!fmt.extensions.empty() && fmt.extensions[0] == ".cbor");
@@ -117,6 +119,33 @@ static void test_cbor_float_decode() {
     assert(std::fabs(std::get<double>(d.root.data) - 1.5) < 1e-12);
 }
 
+static void test_semver_sat_resolution_and_graph() {
+    using namespace serdetk::semver;
+    const auto version = parse_version("1.2.3-alpha.1+build");
+    assert(version && version->major == 1 && version->is_prerelease());
+    const auto root_constraint = parse_constraint("^1.0.0");
+    const auto dependency_constraint = parse_constraint(">=2.0.0 <3.0.0");
+    assert(root_constraint && dependency_constraint);
+
+    Storage storage;
+    assert(storage.add("codec", {*parse_version("1.0.0"), {{"schema", *dependency_constraint}}}));
+    assert(storage.add("codec", {*parse_version("2.0.0"), {}}));
+    assert(storage.add("schema", {*parse_version("2.1.0"), {}}));
+
+    Resolver resolver(storage);
+    const auto resolved = resolver.resolve({{"codec", *root_constraint}});
+    assert(resolved.satisfiable);
+    assert(resolved.selected.at("codec").version == *parse_version("1.0.0"));
+    assert(resolved.selected.at("schema").version == *parse_version("2.1.0"));
+    assert(!resolved.graph.contains_cycle());
+    const auto order = resolved.graph.topological_order();
+    assert(order.size() == 2 && order[0] == "schema" && order[1] == "codec");
+
+    const auto incompatible = parse_constraint(">=3.0.0");
+    assert(incompatible);
+    assert(!resolver.resolve({{"codec", *incompatible}}).satisfiable);
+}
+
 int main() {
     test_convert_no_placeholder_loss();
     test_query_invalid_index_deterministic();
@@ -124,6 +153,7 @@ int main() {
     test_cbor_roundtrip_and_edges();
     test_cbor_malformed_inputs();
     test_cbor_float_decode();
+    test_semver_sat_resolution_and_graph();
     std::puts("serdetk regressions: OK");
     return 0;
 }

@@ -4,6 +4,7 @@
 #define SERDETK_HPP
 
 #include "DSLtk.hpp"
+#include "MiniZIP.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -255,6 +256,17 @@ public:
         auto it = formats_.find(name);
         return it == formats_.end() ? nullptr : &it->second;
     }
+    const CompiledFormat* find(const std::string& name) const {
+        auto it = formats_.find(name);
+        return it == formats_.end() ? nullptr : &it->second;
+    }
+    std::vector<std::string> names() const {
+        std::vector<std::string> out;
+        out.reserve(formats_.size());
+        for (const auto& [name, _] : formats_) out.push_back(name);
+        std::sort(out.begin(), out.end());
+        return out;
+    }
 
 private:
     std::unordered_map<std::string, CompiledFormat> formats_ {};
@@ -266,6 +278,12 @@ struct Descriptor {
     FormatCategory category {FormatCategory::Textual};
     std::vector<std::string> extensions {};
     std::unordered_map<std::string, std::vector<std::string>> sections {};
+};
+
+struct ParseResult {
+    std::optional<Descriptor> descriptor {};
+    Diagnostics diagnostics {};
+    [[nodiscard]] bool ok() const { return descriptor.has_value() && !diagnostics.has_errors(); }
 };
 
 inline std::string trim(std::string s) {
@@ -280,7 +298,13 @@ inline Descriptor parse(std::string_view text) {
     std::string line;
     std::string section;
     int depth = 0;
+    std::size_t line_number = 0;
+    static const std::unordered_set<std::string> known_sections{
+        "identity", "model", "lexical", "binary-layout", "parse", "dump",
+        "formatting", "query", "validation", "conversion", "binarization"
+    };
     while (std::getline(in, line)) {
+        ++line_number;
         if (!line.empty() && line.back() == '\r') line.pop_back();
         const auto hash = line.find('#');
         if (hash != std::string::npos) line = line.substr(0, hash);
@@ -288,7 +312,7 @@ inline Descriptor parse(std::string_view text) {
         if (line.empty()) continue;
 
         if (line == "}") {
-            if (depth == 0) throw ParseError("Invalid SKTL: unmatched closing brace");
+            if (depth == 0) throw ParseError("Invalid SKTL line " + std::to_string(line_number) + ": unmatched closing brace");
             --depth;
             if (depth == 0) section.clear();
             continue;
@@ -296,6 +320,8 @@ inline Descriptor parse(std::string_view text) {
         if (line.back() == '{') {
             ++depth;
             if (depth == 1) section = trim(line.substr(0, line.size() - 1));
+            if (depth != 1 || section.empty() || !known_sections.contains(section))
+                throw ParseError("Invalid SKTL line " + std::to_string(line_number) + ": unknown or nested section");
             continue;
         }
 
@@ -305,9 +331,12 @@ inline Descriptor parse(std::string_view text) {
         if (depth == 0) {
             if (key == "format") {
                 ls >> d.name;
+                if (d.name.empty()) throw ParseError("Invalid SKTL line " + std::to_string(line_number) + ": missing format name");
             } else if (key == "category") {
                 std::string cat;
                 ls >> cat;
+                if (cat != "textual" && cat != "binary")
+                    throw ParseError("Invalid SKTL line " + std::to_string(line_number) + ": category must be textual or binary");
                 d.category = (cat == "binary") ? FormatCategory::Binary : FormatCategory::Textual;
             } else if (key == "extensions") {
                 for (std::string ext; ls >> ext; ) d.extensions.push_back(ext);
@@ -318,14 +347,29 @@ inline Descriptor parse(std::string_view text) {
                 std::string enc;
                 ls >> enc;
                 if (!enc.empty()) d.sections["__top_encoding__"].push_back(enc);
+            } else if (key == "adapter") {
+                std::string adapter;
+                while (ls >> adapter) d.sections["__top_adapter__"].push_back(adapter);
+            } else {
+                throw ParseError("Invalid SKTL line " + std::to_string(line_number) + ": unknown top-level key " + key);
             }
         } else {
             d.sections[section].push_back(line);
         }
     }
-    if (depth != 0) throw ParseError("Invalid SKTL: unclosed section");
+    if (depth != 0) throw ParseError("Invalid SKTL line " + std::to_string(line_number) + ": unclosed section");
     if (d.name.empty()) throw ParseError("Invalid SKTL: missing format name");
     return d;
+}
+
+inline ParseResult parse_with_diagnostics(std::string_view text, std::string file = {}) {
+    try {
+        return {parse(text), {}};
+    } catch (const ParseError& error) {
+        ParseResult result;
+        result.diagnostics.add({Diagnostic::Severity::Error, error.what(), SourceLocation{std::move(file), 0, 0}});
+        return result;
+    }
 }
 
 inline CompiledFormat compile(const Descriptor& d);
@@ -451,8 +495,42 @@ public:
         return out;
     }
 };
-class JQ { public: static Result run(const Document&, std::string_view) { return {}; } };
-class SPARQL { public: static Result run(const Document&, std::string_view) { return {}; } };
+class JQ {
+public:
+    static Result run(const Document& document, std::string_view expression) {
+        std::string query(expression);
+        query = sktl::trim(std::move(query));
+        if (query.empty() || query == ".") return {{&document.root}};
+        if (query.front() != '.') throw QueryError("JQ expression must begin with '.'");
+        query.erase(query.begin());
+        if (query.empty()) return {{&document.root}};
+        std::string path = "root";
+        for (std::size_t index = 0; index < query.size();) {
+            if (query[index] == '.') {
+                ++index;
+                const auto begin = index;
+                while (index < query.size() && query[index] != '.') ++index;
+                path += "." + query.substr(begin, index - begin);
+            } else if (query[index] == '[') {
+                const auto end = query.find(']', index);
+                if (end == std::string::npos) throw QueryError("Unclosed JQ index");
+                path += query.substr(index, end - index + 1);
+                index = end + 1;
+            } else {
+                throw QueryError("Invalid JQ path token");
+            }
+        }
+        return STKQ::run(document, path);
+    }
+};
+class SPARQL {
+public:
+    static Result run(const Document& document, std::string_view expression) {
+        const auto query = sktl::trim(std::string(expression));
+        if (query == "SELECT * WHERE {}" || query == "SELECT * WHERE { }") return {{&document.root}};
+        throw QueryError("SPARQL subset supports only SELECT * WHERE {}");
+    }
+};
 } // namespace query
 
 struct ValidationReport {
@@ -1810,6 +1888,7 @@ inline void validate(const Descriptor& d) {
     static const std::unordered_set<std::string> known{
         "identity", "model", "lexical", "binary-layout", "parse", "dump", "formatting",
         "query", "validation", "conversion", "binarization", "__top_mime__", "__top_encoding__"
+        , "__top_adapter__"
     };
     const char* cat = d.category == FormatCategory::Binary ? "binary" : "textual";
     for (const auto& [section, _] : d.sections) {
@@ -1993,6 +2072,200 @@ SERDETK_DEFINE_FORMAT_NS(cbor, cbor)
 using JQ = query::JQ;
 using STKQ = query::STKQ;
 using SPARQL = query::SPARQL;
+
+namespace manifest {
+
+struct FormatInfo {
+    std::string id {};
+    std::filesystem::path specification {};
+    FormatCategory category {FormatCategory::Textual};
+    std::vector<std::string> extensions {};
+    std::vector<std::string> mime_types {};
+    bool schema_required = false;
+    std::vector<std::string> schema_languages {};
+    bool package_compatible = false;
+    std::vector<std::string> plugins {};
+};
+
+class Manifest {
+public:
+    std::vector<FormatInfo> formats {};
+
+    const FormatInfo* find(std::string_view id) const {
+        const auto it = std::find_if(formats.begin(), formats.end(), [id](const FormatInfo& item) {
+            return item.id == id;
+        });
+        return it == formats.end() ? nullptr : &*it;
+    }
+};
+
+inline std::vector<std::string> yaml_list(std::string value) {
+    value = sktl::trim(std::move(value));
+    if (value.size() < 2 || value.front() != '[' || value.back() != ']') {
+        return value.empty() ? std::vector<std::string>{} : std::vector<std::string>{value};
+    }
+    value = value.substr(1, value.size() - 2);
+    std::vector<std::string> out;
+    std::istringstream stream(value);
+    for (std::string item; std::getline(stream, item, ','); ) out.push_back(sktl::trim(std::move(item)));
+    return out;
+}
+
+inline Manifest load(std::string_view text) {
+    Manifest out;
+    std::istringstream stream{std::string(text)};
+    std::string line;
+    FormatInfo* current = nullptr;
+    while (std::getline(stream, line)) {
+        line = sktl::trim(std::move(line));
+        if (line.empty() || line.front() == '#') continue;
+        if (line.rfind("- id:", 0) == 0) {
+            out.formats.push_back({});
+            current = &out.formats.back();
+            current->id = sktl::trim(line.substr(5));
+            continue;
+        }
+        if (!current) continue;
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        const auto key = sktl::trim(line.substr(0, colon));
+        const auto value = sktl::trim(line.substr(colon + 1));
+        if (key == "specification") current->specification = value;
+        else if (key == "category") current->category = value == "binary" ? FormatCategory::Binary : FormatCategory::Textual;
+        else if (key == "extensions") current->extensions = yaml_list(value);
+        else if (key == "mime_types") current->mime_types = yaml_list(value);
+        else if (key == "schema_required") current->schema_required = value == "true";
+        else if (key == "schema_languages") current->schema_languages = yaml_list(value);
+        else if (key == "package_compatible") current->package_compatible = value == "true";
+        else if (key == "plugins") current->plugins = yaml_list(value);
+    }
+    if (out.formats.empty()) throw ParseError("Manifest contains no format entries");
+    return out;
+}
+
+inline Manifest load_file(const std::filesystem::path& path = "stdspec/MANIFEST.yaml") {
+    std::ifstream in(path);
+    if (!in) throw Error("Failed to open manifest: " + path.string());
+    std::ostringstream text;
+    text << in.rdbuf();
+    return load(text.str());
+}
+
+inline void register_formats(const Manifest& value, const std::filesystem::path& stdspec_root = "stdspec",
+                             FormatRegistry& registry = FormatRegistry::instance()) {
+    for (const auto& item : value.formats) registry.register_format(sktl::compile_file(stdspec_root / item.specification));
+}
+
+} // namespace manifest
+
+struct SchemaSource {
+    std::string identifier {};
+    std::string language {};
+    std::string content {};
+};
+
+struct OperationOptions {
+    std::optional<SchemaSource> schema {};
+    std::map<std::string, std::string> metadata {};
+};
+
+inline Document deserialize(const CompiledFormat& format, const std::vector<std::uint8_t>& bytes,
+                            const OperationOptions& options = {}) {
+    Document document = format.is_binary() ? format.load_bytes(bytes)
+                                           : format.load_string(std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+    if (options.schema) document.schema = options.schema->identifier;
+    for (const auto& [key, value] : options.metadata) document.metadata[key] = value;
+    return document;
+}
+
+inline std::vector<std::uint8_t> serialize(const CompiledFormat& format, Document document,
+                                           const OperationOptions& options = {}) {
+    if (options.schema) document.schema = options.schema->identifier;
+    for (const auto& [key, value] : options.metadata) document.metadata[key] = value;
+    if (format.is_binary()) return format.dump_bytes(document);
+    const auto text = format.dump_string(document);
+    return {text.begin(), text.end()};
+}
+
+namespace package {
+
+inline constexpr std::string_view payload_entry = "payload/data";
+inline constexpr std::string_view metadata_entry = "meta/serdetk.ini";
+inline constexpr std::string_view schema_entry = "schema/source";
+
+struct Contents {
+    Document document {};
+    std::string format_id {};
+    std::optional<SchemaSource> schema {};
+    std::map<std::string, std::string> metadata {};
+};
+
+inline std::string metadata_text(const Contents& value) {
+    std::ostringstream out;
+    out << "format=" << value.format_id << "\n";
+    if (value.schema) {
+        out << "schema.identifier=" << value.schema->identifier << "\n";
+        out << "schema.language=" << value.schema->language << "\n";
+    }
+    for (const auto& [key, item] : value.metadata) out << "meta." << key << "=" << item << "\n";
+    return out.str();
+}
+
+inline std::map<std::string, std::string> parse_metadata(std::string_view text) {
+    std::map<std::string, std::string> out;
+    std::istringstream stream{std::string(text)};
+    for (std::string line; std::getline(stream, line); ) {
+        const auto equal = line.find('=');
+        if (equal != std::string::npos) out.emplace(line.substr(0, equal), line.substr(equal + 1));
+    }
+    return out;
+}
+
+inline minizip::api::archive_result create(const std::filesystem::path& path, const CompiledFormat& format,
+                                            const Contents& value) {
+    auto payload = serialize(format, value.document, {.schema = value.schema, .metadata = value.metadata});
+    auto archive = minizip::api::zipper::make_zipper();
+    archive.set_archive_name(path.filename().string()).set_destination(path.parent_path()).deterministic(true);
+    archive.add_bytes(std::string(payload_entry), std::span<const std::uint8_t>(payload), "application/octet-stream");
+    const auto metadata = metadata_text(value);
+    archive.add_bytes(std::string(metadata_entry), minizip::detail::to_bytes(metadata), "text/plain");
+    if (value.schema && !value.schema->content.empty()) {
+        archive.add_bytes(std::string(schema_entry), minizip::detail::to_bytes(value.schema->content), "text/plain");
+    }
+    return archive.build();
+}
+
+inline Contents extract(const std::filesystem::path& path, const FormatRegistry& registry = FormatRegistry::instance()) {
+    auto opened = minizip::api::extractor::open(path);
+    if (!opened.ok()) throw Error(opened.message());
+    auto metadata_bytes = opened.value().extract_bytes(metadata_entry);
+    if (!metadata_bytes.ok()) throw Error(metadata_bytes.message());
+    const auto fields = parse_metadata(minizip::detail::to_string_lossy(metadata_bytes.value()));
+    const auto format_it = fields.find("format");
+    if (format_it == fields.end()) throw ParseError("STK package is missing format metadata");
+    const auto* format = registry.find(format_it->second);
+    if (!format) throw FormatError("STK package references unregistered format: " + format_it->second);
+    auto payload = opened.value().extract_bytes(payload_entry);
+    if (!payload.ok()) throw Error(payload.message());
+    Contents out;
+    out.format_id = format_it->second;
+    for (const auto& [key, value] : fields) {
+        if (key.rfind("meta.", 0) == 0) out.metadata[key.substr(5)] = value;
+    }
+    SchemaSource schema;
+    if (const auto it = fields.find("schema.identifier"); it != fields.end()) schema.identifier = it->second;
+    if (const auto it = fields.find("schema.language"); it != fields.end()) schema.language = it->second;
+    auto source = opened.value().extract_bytes(schema_entry);
+    if (source.ok()) schema.content = minizip::detail::to_string_lossy(source.value());
+    if (!schema.identifier.empty() || !schema.content.empty()) out.schema = std::move(schema);
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(payload.value().size());
+    for (std::byte value : payload.value()) bytes.push_back(std::to_integer<std::uint8_t>(value));
+    out.document = deserialize(*format, bytes, {.schema = out.schema, .metadata = out.metadata});
+    return out;
+}
+
+} // namespace package
 
 } // namespace serdetk
 

@@ -25,9 +25,9 @@ static void expect_parse_error(Fn&& fn) {
 }
 
 static void test_sktl_and_samples() {
-    auto jf = serdetk::sktl::compile_file("std/textual/JSON.sktl");
-    auto xf = serdetk::sktl::compile_file("std/textual/XML.sktl");
-    auto sf = serdetk::sktl::compile_file("std/textual/S-Expr.sktl");
+    auto jf = serdetk::sktl::compile_file("stdspec/textual/JSON.sktl");
+    auto xf = serdetk::sktl::compile_file("stdspec/textual/XML.sktl");
+    auto sf = serdetk::sktl::compile_file("stdspec/textual/S-Expr.sktl");
     assert(jf.name == "JSON" && xf.name == "XML" && sf.name == "S-Expr");
 
     const char* json[] = {"samples/JSON/scientific-dataset.json","samples/JSON/infrstructure-config.json","samples/JSON/weird-edge-cases.json"};
