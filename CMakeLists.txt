@@ -33,6 +33,7 @@ target_compile_features(serdetk-cli PRIVATE cxx_std_20)
 add_subdirectory(stdspec)
 add_subdirectory(stdplugin/SerdeTk/Semver)
 add_subdirectory(stdplugin/SerdeTk/SchemaRegistry)
+add_subdirectory(stdplugin/SerdeTk/XPath)
 add_subdirectory(stdplugin/MiniZIP/PackageIntegrity)
 add_subdirectory(tests/SerdeTk)
 
