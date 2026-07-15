@@ -1,4 +1,0 @@
-add_library(MiniZIPPackageIntegrity STATIC Checksum.cpp ManifestSigner.cpp PackageIntegrity.cpp)
-target_include_directories(MiniZIPPackageIntegrity PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(MiniZIPPackageIntegrity PUBLIC MiniZIP)
-target_compile_features(MiniZIPPackageIntegrity PUBLIC cxx_std_20)
